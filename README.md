@@ -8,25 +8,27 @@ The project has no external Rust dependencies. Passive configuration and
 socket inspection support IPv4 and IPv6. Active subnet discovery, ICMP echo,
 and the `check` command's default-gateway health path remain IPv4-only.
 
-## Build and run
+## Install and run
 
 ```console
-cargo build --release
-target/release/networkrs
-target/release/networkrs help
+cargo install networkrs
+networkrs
+networkrs help
 ```
+
+To build a checkout instead, run `cargo build --release` and use
+`target/release/networkrs`.
 
 The default `all` command is passive. Active traffic is generated only by the
 explicit `scan`, `probe`, and `check --active` commands.
 
 ## Library use
 
-The same kernel-facing code is available as a Rust library crate. Add
-`networkrs` as a path dependency while it is local:
+The same kernel-facing code is available as a Rust library crate:
 
 ```toml
 [dependencies]
-networkrs = { path = "../networkrs" }
+networkrs = "0.1.0"
 ```
 
 Then call the typed APIs directly:
