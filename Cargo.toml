@@ -1,0 +1,13 @@
+[package]
+name = "networkrs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Dependency-free Linux network inspection through kernel interfaces"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/EriksRemess/networkrs"
+keywords = ["linux", "networking", "netlink", "cli"]
+categories = ["command-line-utilities", "network-programming", "os::linux-apis"]
+
+[dependencies]
