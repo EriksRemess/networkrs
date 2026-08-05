@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::{c_char, c_int, c_ulong, c_ushort};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -54,6 +54,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
     if command != "scan"
         && command != "probe"
         && command != "traffic"
+        && command != "watch"
         && let Some(extra) = arguments.get(1)
     {
         return Err(format!("unexpected argument: {extra}\n\n{}", usage()));
@@ -66,6 +67,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
         && command != "hardware"
         && command != "sockets"
         && command != "traffic"
+        && command != "watch"
         && let Some(argument) = argument.map(String::as_str)
     {
         return Err(format!("unexpected argument: {argument}\n\n{}", usage()));
@@ -105,7 +107,11 @@ fn run(args: impl Iterator<Item = String>) -> Result<ExitCode, String> {
         "neighbors" => print_neighbors(argument.map(String::as_str))
             .map_err(|error| format!("cannot read neighbors: {error}"))?,
         "scan" => scan(&arguments).map_err(|error| format!("cannot scan network: {error}"))?,
-        "watch" => watch().map_err(|error| format!("cannot watch network: {error}"))?,
+        "watch" => {
+            let filter = parse_watch_arguments(&arguments)
+                .map_err(|error| format!("cannot watch network: {error}"))?;
+            watch(filter).map_err(|error| format!("cannot watch network: {error}"))?
+        }
         "check" => {
             let active = match arguments.as_slice() {
                 [] => false,
@@ -150,10 +156,9 @@ fn run_json(command: &str, arguments: &[String]) -> Result<ExitCode, String> {
     use json::Value;
 
     if command == "watch" {
-        if !arguments.is_empty() {
-            return Err("watch accepts no arguments".into());
-        }
-        watch_json().map_err(|error| format!("cannot watch network: {error}"))?;
+        let filter = parse_watch_arguments(arguments)
+            .map_err(|error| format!("cannot watch network: {error}"))?;
+        watch_json(filter).map_err(|error| format!("cannot watch network: {error}"))?;
         return Ok(ExitCode::SUCCESS);
     }
     if command == "traffic" {
@@ -710,7 +715,7 @@ fn optional_json_bool(value: Option<bool>) -> json::Value {
 }
 
 fn usage() -> &'static str {
-    "Usage: networkrs [--json] [COMMAND]\n\nCommands:\n  all                    Show current network configuration (default)\n  interfaces             Show interfaces, addresses, link state, and counters\n  links                  Show kernel link topology and metadata\n  hardware [INTERFACE]   Show driver, link modes, features, and statistics\n  addresses              Show detailed kernel IP address records\n  routes                 Show all IPv4 and IPv6 routing tables\n  rules                  Show IPv4 and IPv6 policy-routing rules\n  route <ADDRESS>        Show the kernel route to an IP address\n  neighbors [INTERFACE]  Show cached IPv4 and IPv6 neighbors\n  scan [OPTIONS] [TARGET] Actively discover neighbors on a local IPv4 network\n  watch                  Stream kernel network changes\n  check [--active]       Check IPv4 health; optionally exercise the path\n  probe HOST [PORTS]     Test one or more TCP ports and report route and timing\n  sockets [VIEW]         Show IP sockets (all, tcp, udp, listening, connected)\n  traffic [OPTIONS]      Sample or continuously watch interface traffic rates\n  wifi                   Show nl80211 Wi-Fi connection details\n  dns                    Show resolver configuration\n  help                   Show this help\n\nGlobal options:\n  --json                 Emit JSON; streaming commands emit one object per line"
+    "Usage: networkrs [--json] [COMMAND]\n\nCommands:\n  all                    Show current network configuration (default)\n  interfaces             Show interfaces, addresses, link state, and counters\n  links                  Show kernel link topology and metadata\n  hardware [INTERFACE]   Show driver, link modes, features, and statistics\n  addresses              Show detailed kernel IP address records\n  routes                 Show all IPv4 and IPv6 routing tables\n  rules                  Show IPv4 and IPv6 policy-routing rules\n  route <ADDRESS>        Show the kernel route to an IP address\n  neighbors [INTERFACE]  Show cached IPv4 and IPv6 neighbors\n  scan [OPTIONS] [TARGET] Actively discover neighbors on a local IPv4 network\n  watch [OPTIONS]        Stream kernel network changes\n  check [--active]       Check IPv4 health; optionally exercise the path\n  probe HOST [PORTS]     Test one or more TCP ports and report route and timing\n  sockets [VIEW]         Show IP sockets (all, tcp, udp, listening, connected)\n  traffic [OPTIONS]      Sample or continuously watch interface traffic rates\n  wifi                   Show nl80211 Wi-Fi connection details\n  dns                    Show resolver configuration\n  help                   Show this help\n\nGlobal options:\n  --json                 Emit JSON; streaming commands emit one object per line"
 }
 
 fn print_system() {
@@ -1246,7 +1251,7 @@ fn print_neighbors(selection: Option<&str>) -> io::Result<()> {
     if let Some(index) = selected_index {
         neighbors.retain(|neighbor| neighbor.interface_index == index);
     }
-    print_neighbor_entries(neighbors, false, None);
+    print_neighbor_entries(neighbors, false, None, "None cached");
     Ok(())
 }
 
@@ -1254,6 +1259,7 @@ fn print_neighbor_entries(
     neighbors: Vec<netlink::Neighbor>,
     resolve_names: bool,
     changed: Option<&HashSet<Ipv4Addr>>,
+    empty_message: &str,
 ) {
     let interface_names = interface_names();
     let vendors = oui::load();
@@ -1270,7 +1276,7 @@ fn print_neighbor_entries(
 
     println!("Neighbors");
     if neighbors.is_empty() {
-        println!("  None cached");
+        println!("  {empty_message}");
     }
     for neighbor in neighbors {
         let interface = interface_names
@@ -1379,12 +1385,39 @@ fn interface_names() -> HashMap<i32, String> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanFilter {
+    Changed,
+    Unchanged,
+}
+
+impl ScanFilter {
+    fn matches(self, neighbor: &netlink::Neighbor, changed: &HashSet<Ipv4Addr>) -> bool {
+        let is_changed = match neighbor.address {
+            IpAddr::V4(address) => changed.contains(&address),
+            IpAddr::V6(_) => false,
+        };
+        match self {
+            Self::Changed => is_changed,
+            Self::Unchanged => !is_changed,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::Unchanged => "unchanged",
+        }
+    }
+}
+
 struct ScanArguments {
     selection: Option<String>,
     wait_ms: u64,
     retries: u32,
     resolve_names: bool,
     excluded: HashSet<Ipv4Addr>,
+    filter: Option<ScanFilter>,
 }
 
 fn scan(arguments: &[String]) -> io::Result<()> {
@@ -1410,15 +1443,33 @@ fn scan(arguments: &[String]) -> io::Result<()> {
     )?;
     let neighbor_count = result.neighbors.len();
     let changed_count = result.changed.len();
+    let mut neighbors = result.neighbors;
+    if let Some(filter) = arguments.filter {
+        neighbors.retain(|neighbor| filter.matches(neighbor, &result.changed));
+    }
+    let matched_count = neighbors.len();
     print_neighbor_entries(
-        result.neighbors,
+        neighbors,
         arguments.resolve_names,
         Some(&result.changed),
+        if arguments.filter.is_some() {
+            "None matched the filter"
+        } else {
+            "None cached"
+        },
     );
-    println!(
-        "Scan complete: {neighbor_count} neighbors, {changed_count} new or changed, {:.1}s",
-        result.elapsed.as_secs_f32()
-    );
+    if let Some(filter) = arguments.filter {
+        println!(
+            "Scan complete: {matched_count} {} of {neighbor_count} neighbors, {changed_count} new or changed, {:.1}s",
+            filter.name(),
+            result.elapsed.as_secs_f32()
+        );
+    } else {
+        println!(
+            "Scan complete: {neighbor_count} neighbors, {changed_count} new or changed, {:.1}s",
+            result.elapsed.as_secs_f32()
+        );
+    }
     Ok(())
 }
 
@@ -1435,10 +1486,13 @@ fn scan_json(arguments: &[String]) -> io::Result<json::Value> {
     )?;
     let interface_names = interface_names();
     let vendors = oui::load();
+    let mut filtered_neighbors = result.neighbors;
+    if let Some(filter) = arguments.filter {
+        filtered_neighbors.retain(|neighbor| filter.matches(neighbor, &result.changed));
+    }
     let resolved_names = if arguments.resolve_names {
         resolver::reverse_names(
-            &result
-                .neighbors
+            &filtered_neighbors
                 .iter()
                 .map(|neighbor| neighbor.address)
                 .collect::<Vec<_>>(),
@@ -1446,8 +1500,7 @@ fn scan_json(arguments: &[String]) -> io::Result<json::Value> {
     } else {
         HashMap::new()
     };
-    let neighbors = result
-        .neighbors
+    let neighbors = filtered_neighbors
         .into_iter()
         .map(|neighbor| {
             let address = neighbor.address;
@@ -1503,6 +1556,10 @@ fn scan_json(arguments: &[String]) -> io::Result<json::Value> {
             ),
         ),
         ("neighbors", json::Value::Array(neighbors)),
+        (
+            "filter",
+            json::optional_string(arguments.filter.map(ScanFilter::name)),
+        ),
         ("changed", json::Value::number(result.changed.len())),
         (
             "elapsedMilliseconds",
@@ -1518,10 +1575,36 @@ fn parse_scan_arguments(arguments: &[String]) -> io::Result<ScanArguments> {
         retries: 1,
         resolve_names: true,
         excluded: HashSet::new(),
+        filter: None,
     };
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--filter" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--filter requires changed or unchanged",
+                    )
+                })?;
+                let filter = match value.as_str() {
+                    "changed" => ScanFilter::Changed,
+                    "unchanged" => ScanFilter::Unchanged,
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "--filter must be changed or unchanged",
+                        ));
+                    }
+                };
+                if parsed.filter.replace(filter).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "scan filter was specified more than once",
+                    ));
+                }
+            }
             "--wait" => {
                 index += 1;
                 parsed.wait_ms = parse_option_value(arguments, index, "--wait")?;
@@ -1861,16 +1944,33 @@ fn parse_default_ipv4_route(contents: &str) -> Option<DefaultIpv4Route> {
 struct ProbeArguments {
     host: String,
     ports: Vec<u16>,
+    filter: Option<TcpProbeStatus>,
     timeout_ms: u64,
 }
 
 fn parse_probe_arguments(arguments: &[String]) -> io::Result<ProbeArguments> {
     let mut host = None;
     let mut ports = None;
+    let mut filter = None;
     let mut timeout_ms = 3000_u64;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
+            "--filter" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--filter requires open, closed, or failed",
+                    )
+                })?;
+                if filter.replace(parse_probe_filter(value)?).is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "probe filter was specified more than once",
+                    ));
+                }
+            }
             "--timeout" => {
                 index += 1;
                 timeout_ms = parse_option_value(arguments, index, "--timeout")?;
@@ -1902,8 +2002,21 @@ fn parse_probe_arguments(arguments: &[String]) -> io::Result<ProbeArguments> {
         host: host
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "probe requires a host"))?,
         ports: ports.unwrap_or_else(|| vec![443]),
+        filter,
         timeout_ms,
     })
+}
+
+fn parse_probe_filter(value: &str) -> io::Result<TcpProbeStatus> {
+    match value {
+        "open" => Ok(TcpProbeStatus::Connected),
+        "closed" => Ok(TcpProbeStatus::ConnectionRefused),
+        "failed" => Ok(TcpProbeStatus::Failed),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--filter must be open, closed, or failed",
+        )),
+    }
 }
 
 fn parse_probe_ports(value: &str) -> io::Result<Vec<u16>> {
@@ -1964,11 +2077,21 @@ fn too_many_probe_ports() -> io::Error {
     )
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TcpProbeStatus {
     Connected,
     ConnectionRefused,
     Failed,
+}
+
+impl TcpProbeStatus {
+    fn filter_name(self) -> &'static str {
+        match self {
+            Self::Connected => "open",
+            Self::ConnectionRefused => "closed",
+            Self::Failed => "failed",
+        }
+    }
 }
 
 struct TcpProbeResult {
@@ -2056,7 +2179,7 @@ fn probe(arguments: &[String]) -> io::Result<bool> {
     let arguments = parse_probe_arguments(arguments)?;
     let (destination, route) = resolve_probe_destination(&arguments.host, arguments.ports[0])?;
     let interface_names = interface_names();
-    if arguments.ports.len() == 1 {
+    if arguments.ports.len() == 1 && arguments.filter.is_none() {
         println!(
             "TCP probe {}:{} ({})",
             arguments.host,
@@ -2091,7 +2214,9 @@ fn probe(arguments: &[String]) -> io::Result<bool> {
         &arguments.ports,
         std::time::Duration::from_millis(arguments.timeout_ms),
     );
-    if let [result] = results.as_slice() {
+    if arguments.filter.is_none()
+        && let [result] = results.as_slice()
+    {
         match result.status {
             TcpProbeStatus::Connected => println!(
                 "  Result: connected in {:.1}ms",
@@ -2108,7 +2233,15 @@ fn probe(arguments: &[String]) -> io::Result<bool> {
             ),
         }
     } else {
-        for result in &results {
+        let matching = results
+            .iter()
+            .filter(|result| {
+                arguments
+                    .filter
+                    .is_none_or(|filter| result.status == filter)
+            })
+            .collect::<Vec<_>>();
+        for result in &matching {
             match result.status {
                 TcpProbeStatus::Connected => println!(
                     "  {}/tcp open in {:.1}ms",
@@ -2128,6 +2261,11 @@ fn probe(arguments: &[String]) -> io::Result<bool> {
                 ),
             }
         }
+        if matching.is_empty()
+            && let Some(filter) = arguments.filter
+        {
+            println!("  No {} TCP ports", filter.filter_name());
+        }
         let open = results
             .iter()
             .filter(|result| result.status == TcpProbeStatus::Connected)
@@ -2137,10 +2275,20 @@ fn probe(arguments: &[String]) -> io::Result<bool> {
             .filter(|result| result.status == TcpProbeStatus::ConnectionRefused)
             .count();
         let failed = results.len() - open - closed;
-        println!(
-            "Port scan complete: {open} open, {closed} closed, {failed} failed, {:.1}ms",
-            started.elapsed().as_secs_f64() * 1000.0
-        );
+        if let Some(filter) = arguments.filter {
+            println!(
+                "Port scan complete: {} {}, {} scanned, {:.1}ms",
+                matching.len(),
+                filter.filter_name(),
+                results.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        } else {
+            println!(
+                "Port scan complete: {open} open, {closed} closed, {failed} failed, {:.1}ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
     Ok(results.iter().any(TcpProbeResult::reachable))
 }
@@ -2156,7 +2304,9 @@ fn probe_json(arguments: &[String]) -> io::Result<(json::Value, bool)> {
         std::time::Duration::from_millis(arguments.timeout_ms),
     );
     let reachable = results.iter().any(TcpProbeResult::reachable);
-    if let [result] = results.as_slice() {
+    if arguments.filter.is_none()
+        && let [result] = results.as_slice()
+    {
         return Ok((
             json::Value::object([
                 ("host", json::Value::string(arguments.host)),
@@ -2174,8 +2324,14 @@ fn probe_json(arguments: &[String]) -> io::Result<(json::Value, bool)> {
             reachable,
         ));
     }
+    let scanned_ports = results.len();
     let port_results = results
         .into_iter()
+        .filter(|result| {
+            arguments
+                .filter
+                .is_none_or(|filter| result.status == filter)
+        })
         .map(|result| {
             json::Value::object([
                 ("port", json::Value::number(result.port)),
@@ -2199,6 +2355,11 @@ fn probe_json(arguments: &[String]) -> io::Result<(json::Value, bool)> {
             ("address", json::Value::string(destination.ip().to_string())),
             ("route", route_value),
             ("reachable", json::Value::Bool(reachable)),
+            (
+                "filter",
+                json::optional_string(arguments.filter.map(|filter| filter.filter_name())),
+            ),
+            ("scannedPorts", json::Value::number(scanned_ports)),
             ("ports", json::Value::Array(port_results)),
             (
                 "elapsedMilliseconds",
@@ -2599,13 +2760,62 @@ fn json_check_item(name: &str, status: &str, detail: impl Into<String>) -> json:
     ])
 }
 
-fn watch() -> io::Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchFilter {
+    Link,
+    Address,
+    Route,
+    Neighbor,
+}
+
+impl WatchFilter {
+    fn matches(self, event: &netlink::NetworkEvent) -> bool {
+        matches!(
+            (self, event),
+            (Self::Link, netlink::NetworkEvent::Link { .. })
+                | (Self::Address, netlink::NetworkEvent::Address { .. })
+                | (Self::Route, netlink::NetworkEvent::Route { .. })
+                | (Self::Neighbor, netlink::NetworkEvent::Neighbor { .. })
+        )
+    }
+}
+
+fn parse_watch_arguments(arguments: &[String]) -> io::Result<Option<WatchFilter>> {
+    match arguments {
+        [] => Ok(None),
+        [option, value] if option == "--filter" => match value.as_str() {
+            "link" => Ok(Some(WatchFilter::Link)),
+            "address" => Ok(Some(WatchFilter::Address)),
+            "route" => Ok(Some(WatchFilter::Route)),
+            "neighbor" => Ok(Some(WatchFilter::Neighbor)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--filter must be link, address, route, or neighbor",
+            )),
+        },
+        [option] if option == "--filter" => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--filter requires link, address, route, or neighbor",
+        )),
+        [option, ..] if option.starts_with('-') => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown watch option: {option}"),
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "watch accepts only --filter link|address|route|neighbor",
+        )),
+    }
+}
+
+fn watch(filter: Option<WatchFilter>) -> io::Result<()> {
     let mut interface_names = interface_names();
     let vendors = oui::load();
     println!("Watching kernel network events (Ctrl-C to stop)");
     io::stdout().flush()?;
 
     netlink::watch_events(|event| {
+        let emit = filter.is_none_or(|filter| filter.matches(&event));
         match event {
             netlink::NetworkEvent::Link {
                 removed,
@@ -2618,13 +2828,17 @@ fn watch() -> io::Result<()> {
                     .clone()
                     .unwrap_or_else(|| format!("ifindex {interface_index}"));
                 if removed {
-                    println!("link removed {label}");
+                    if emit {
+                        println!("link removed {label}");
+                    }
                     interface_names.remove(&interface_index);
                 } else {
                     if let Some(name) = name {
                         interface_names.insert(interface_index, name);
                     }
-                    println!("link changed {label} {}", if up { "up" } else { "down" });
+                    if emit {
+                        println!("link changed {label} {}", if up { "up" } else { "down" });
+                    }
                 }
             }
             netlink::NetworkEvent::Address {
@@ -2634,10 +2848,12 @@ fn watch() -> io::Result<()> {
                 prefix,
             } => {
                 let interface = interface_label(&interface_names, interface_index);
-                println!(
-                    "address {} {address}/{prefix} dev {interface}",
-                    if removed { "removed" } else { "added" }
-                );
+                if emit {
+                    println!(
+                        "address {} {address}/{prefix} dev {interface}",
+                        if removed { "removed" } else { "added" }
+                    );
+                }
             }
             netlink::NetworkEvent::Route { removed, route } => {
                 let target = if route.destination.is_unspecified() && route.prefix == 0 {
@@ -2657,10 +2873,12 @@ fn watch() -> io::Result<()> {
                     .metric
                     .map(|metric| format!(" metric {metric}"))
                     .unwrap_or_default();
-                println!(
-                    "route {} {target}{gateway}{interface}{metric}",
-                    if removed { "removed" } else { "changed" }
-                );
+                if emit {
+                    println!(
+                        "route {} {target}{gateway}{interface}{metric}",
+                        if removed { "removed" } else { "changed" }
+                    );
+                }
             }
             netlink::NetworkEvent::Neighbor { removed, neighbor } => {
                 let interface = interface_label(&interface_names, neighbor.interface_index);
@@ -2675,21 +2893,24 @@ fn watch() -> io::Result<()> {
                     .and_then(|address| oui::vendor(address, &vendors))
                     .map(|vendor| format!(" vendor {vendor}"))
                     .unwrap_or_default();
-                println!(
-                    "neighbor {} {} dev {interface}{link_address}{vendor} {}",
-                    if removed { "removed" } else { "changed" },
-                    neighbor.address,
-                    neighbor.state
-                );
+                if emit {
+                    println!(
+                        "neighbor {} {} dev {interface}{link_address}{vendor} {}",
+                        if removed { "removed" } else { "changed" },
+                        neighbor.address,
+                        neighbor.state
+                    );
+                }
             }
         }
         let _ = io::stdout().flush();
     })
 }
 
-fn watch_json() -> io::Result<()> {
+fn watch_json(filter: Option<WatchFilter>) -> io::Result<()> {
     let mut interface_names = interface_names();
     netlink::watch_events(|event| {
+        let emit = filter.is_none_or(|filter| filter.matches(&event));
         let value = match event {
             netlink::NetworkEvent::Link {
                 removed,
@@ -2752,8 +2973,10 @@ fn watch_json() -> io::Result<()> {
                 ("neighbor", json_neighbor(neighbor, &interface_names)),
             ]),
         };
-        println!("{}", value.render());
-        let _ = io::stdout().flush();
+        if emit {
+            println!("{}", value.render());
+            let _ = io::stdout().flush();
+        }
     })
 }
 
@@ -3108,14 +3331,24 @@ fn format_microseconds(microseconds: u32) -> String {
 
 fn print_traffic(arguments: &[String]) -> io::Result<()> {
     let (selection, interval, watch) = parse_traffic_arguments(arguments)?;
+    let refresh = watch && io::stdout().is_terminal();
+    let mut rendered_lines = 0;
     loop {
         let sample = traffic::sample(selection.as_deref(), interval)?;
+        if refresh && rendered_lines != 0 {
+            print!("\x1b[{rendered_lines}A\r\x1b[J");
+        }
+        rendered_lines = traffic_sample_line_count(sample.interfaces.len());
         print_traffic_sample(sample);
         io::stdout().flush()?;
         if !watch {
             return Ok(());
         }
     }
+}
+
+fn traffic_sample_line_count(interface_count: usize) -> usize {
+    1 + interface_count * 3
 }
 
 fn traffic_json(arguments: &[String]) -> io::Result<()> {
@@ -3690,15 +3923,40 @@ mod tests {
             "2".to_owned(),
             "--exclude".to_owned(),
             "10.0.0.1".to_owned(),
+            "--filter".to_owned(),
+            "changed".to_owned(),
             "--no-resolve".to_owned(),
         ];
         let parsed = parse_scan_arguments(&arguments).unwrap();
         assert_eq!(parsed.selection.as_deref(), Some("enp5s0"));
         assert_eq!(parsed.wait_ms, 500);
         assert_eq!(parsed.retries, 2);
+        assert_eq!(parsed.filter, Some(ScanFilter::Changed));
         assert!(!parsed.resolve_names);
         assert!(parsed.excluded.contains(&Ipv4Addr::new(10, 0, 0, 1)));
         assert!(parse_scan_arguments(&["--retries".into(), "0".into()]).is_err());
+        assert!(parse_scan_arguments(&["--filter".into()]).is_err());
+        assert!(parse_scan_arguments(&["--filter".into(), "unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn parses_and_matches_watch_filters() {
+        assert_eq!(
+            parse_watch_arguments(&["--filter".into(), "route".into()]).unwrap(),
+            Some(WatchFilter::Route)
+        );
+        assert_eq!(parse_watch_arguments(&[]).unwrap(), None);
+        assert!(parse_watch_arguments(&["--filter".into()]).is_err());
+        assert!(parse_watch_arguments(&["--filter".into(), "unknown".into()]).is_err());
+
+        let event = netlink::NetworkEvent::Link {
+            removed: false,
+            interface_index: 2,
+            name: Some("eth0".into()),
+            up: true,
+        };
+        assert!(WatchFilter::Link.matches(&event));
+        assert!(!WatchFilter::Route.matches(&event));
     }
 
     #[test]
@@ -3706,23 +3964,33 @@ mod tests {
         let parsed = parse_probe_arguments(&[
             "example.test".into(),
             "22,80,443,8000-8002".into(),
+            "--filter".into(),
+            "closed".into(),
             "--timeout".into(),
             "750".into(),
         ])
         .unwrap();
         assert_eq!(parsed.host, "example.test");
         assert_eq!(parsed.ports, [22, 80, 443, 8000, 8001, 8002]);
+        assert_eq!(parsed.filter, Some(TcpProbeStatus::ConnectionRefused));
         assert_eq!(parsed.timeout_ms, 750);
         assert_eq!(parse_probe_ports("443,22,443").unwrap(), [22, 443]);
         assert_eq!(
-            parse_probe_arguments(&["host".into()]).unwrap().ports,
-            [443]
+            (
+                parse_probe_arguments(&["host".into()]).unwrap().ports,
+                parse_probe_arguments(&["host".into()]).unwrap().filter,
+            ),
+            (vec![443], None)
         );
         assert!(parse_probe_arguments(&["host".into(), "--timeout".into(), "20".into()]).is_err());
         assert!(parse_probe_arguments(&["host".into(), "0".into()]).is_err());
         assert!(parse_probe_arguments(&["host".into(), "90-80".into()]).is_err());
         assert!(parse_probe_arguments(&["host".into(), "22,,80".into()]).is_err());
         assert!(parse_probe_arguments(&["host".into(), "1-4097".into()]).is_err());
+        assert!(parse_probe_arguments(&["host".into(), "--filter".into()]).is_err());
+        assert!(
+            parse_probe_arguments(&["host".into(), "--filter".into(), "unknown".into()]).is_err()
+        );
     }
 
     #[test]
@@ -3737,6 +4005,8 @@ mod tests {
         assert_eq!(parsed.0.as_deref(), Some("eth0"));
         assert_eq!(parsed.1, std::time::Duration::from_millis(250));
         assert!(parsed.2);
+        assert_eq!(traffic_sample_line_count(0), 1);
+        assert_eq!(traffic_sample_line_count(2), 7);
         assert!(parse_traffic_arguments(&["--interval".into(), "50".into()]).is_err());
     }
 

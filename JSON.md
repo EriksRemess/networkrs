@@ -62,6 +62,10 @@ index. Scan results append:
 - `vendor`: installed-OUI lookup or `private/randomized`
 - `changed`: whether the address/link-address pair changed during this scan
 
+For `scan --filter changed|unchanged`, the `neighbors` array contains only
+matching records and the top-level `filter` field names the selection. The
+top-level `changed` count still describes the complete scan result.
+
 ## Socket diagnostics
 
 The `sockets` object always contains `diagnosticsAvailable` and
@@ -80,7 +84,10 @@ For a single selected port, `probe` retains the scalar `port`, `status`, `error`
 and `elapsedMilliseconds` fields. A multi-port probe replaces those scalar
 result fields with a `ports` array; each entry contains `port`, `status`, `open`,
 `reachable`, `error`, and `elapsedMilliseconds`. The top-level elapsed value is
-the wall-clock duration of the bounded concurrent scan.
+the wall-clock duration of the bounded concurrent scan. When `--filter` is
+present, the `ports` array contains only matching results, `filter` names the
+selection, and `scannedPorts` still reports the number of attempted ports. A
+filter uses this array shape even when only one port was selected.
 
 `probe` exits with status 0 when any selected port connects or explicitly
 refuses the connection. Refusal demonstrates that the destination host was
@@ -97,6 +104,10 @@ sample. Each interval produces one line.
 - `event`: `added`, `changed`, or `removed`
 - `object`: `link`, `address`, `route`, or `neighbor`
 - object-specific identity and data
+
+`watch --filter link|address|route|neighbor --json` emits only the selected
+object type. Filtered link events are still consumed internally so interface
+names remain current in later emitted records.
 
 Consumers must not assume that the first event is an initial snapshot. Run a
 snapshot command first when initial state is required, then consume the event

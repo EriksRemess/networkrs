@@ -72,9 +72,9 @@ networkrs rules
 networkrs route <ADDRESS>
 networkrs neighbors [INTERFACE]
 networkrs scan [OPTIONS] [INTERFACE|IPv4/CIDR]
-networkrs watch
+networkrs watch [--filter link|address|route|neighbor]
 networkrs check [--active]
-networkrs probe HOST [PORTS] [--timeout MS]
+networkrs probe HOST [PORTS] [--filter open|closed|failed] [--timeout MS]
 networkrs sockets [all|tcp|udp|listening|connected]
 networkrs traffic [INTERFACE] [--interval MS] [--watch]
 networkrs wifi
@@ -117,6 +117,7 @@ reads the resulting neighbor table. It accepts:
 - `--wait MS` between retries, up to 60000 (default 1200)
 - `--retries N` from 1 through 10 (default 1)
 - repeatable `--exclude IPv4`
+- `--filter changed|unchanged` to limit displayed neighbor results
 - `--no-resolve` to skip reverse name lookup
 - one interface or directly connected IPv4 CIDR
 
@@ -156,11 +157,15 @@ MCS, channel width, and spatial streams when supplied by the driver.
 ### Monitoring and health checks
 
 `watch` subscribes to route-netlink multicast groups and streams link,
-IPv4/IPv6 address, route, and neighbor changes without polling.
+IPv4/IPv6 address, route, and neighbor changes without polling. Use
+`--filter link`, `address`, `route`, or `neighbor` to emit only one object type;
+link events still maintain interface-name state when another type is selected.
 
 `traffic` samples sysfs counters over a configurable interval (100 through
 60000 ms) and reports RX/TX bytes and packets per second plus error/drop deltas.
-`--watch` repeats until interrupted.
+`--watch` repeats until interrupted. On an interactive terminal it refreshes the
+previous sample in place; redirected text output remains append-only for logs
+and pipelines, as does `--json` output.
 
 `check` is passive by default. It validates the default route, interface/carrier,
 gateway neighbor, and resolver configuration, returning status 0 for healthy,
@@ -178,7 +183,9 @@ most 4096 distinct ports with at most 64 concurrent connections, and preserves
 the existing single-port output for one selected port. `--timeout MS` sets the
 per-port timeout and accepts 100 through 60000. A connected or refused port
 proves host reachability; the command returns status 1 only when every selected
-port fails for another reason.
+port fails for another reason. `--filter open`, `--filter closed`, or
+`--filter failed` limits the displayed port rows without changing which ports
+are attempted or how reachability determines the exit status.
 
 ### DNS
 
