@@ -638,6 +638,7 @@ fn neighbors(family: u8) -> io::Result<Vec<Neighbor>> {
         }
     }
 
+    neighbors.retain(|neighbor| ip_address_matches_family(neighbor.address, family));
     neighbors.sort_by_key(|neighbor| (neighbor.interface_index, neighbor.address));
     Ok(neighbors)
 }
@@ -681,6 +682,7 @@ fn addresses_for_family(family: u8) -> io::Result<Vec<Address>> {
         }
     }
 
+    addresses.retain(|address| ip_address_matches_family(address.local, family));
     addresses.sort_by_key(|address| (address.interface_index, address.local));
     Ok(addresses)
 }
@@ -740,6 +742,7 @@ fn routes_for_family(family: u8) -> io::Result<Vec<Route>> {
         "route",
         parse_route,
     )?;
+    routes.retain(|route| ip_address_matches_family(route.destination, family));
     routes.sort_by_key(|route| (route.table, route.destination, route.prefix, route.metric));
     Ok(routes)
 }
@@ -792,6 +795,7 @@ fn rules_for_family(family: u8) -> io::Result<Vec<Rule>> {
     };
     send_request(&socket, &request)?;
     let mut rules = receive_dump(&socket, RULE_DUMP_SEQUENCE, RTM_NEWRULE, "rule", parse_rule)?;
+    rules.retain(|rule| ip_family_matches_family(rule.family, family));
     rules.sort_by_key(|rule| rule.priority);
     Ok(rules)
 }
@@ -1444,6 +1448,22 @@ fn ip_from_bytes(family: u8, value: &[u8]) -> Option<IpAddr> {
         AF_INET6 => ipv6_from_bytes(value).map(IpAddr::V6),
         _ => None,
     }
+}
+
+fn ip_address_matches_family(address: IpAddr, family: u8) -> bool {
+    // If a requested protocol family has no registered handler, rtnetlink can
+    // fall back to an all-family dump instead of returning an error.
+    matches!(
+        (address, family),
+        (IpAddr::V4(_), AF_INET) | (IpAddr::V6(_), AF_INET6)
+    )
+}
+
+fn ip_family_matches_family(record_family: IpFamily, family: u8) -> bool {
+    matches!(
+        (record_family, family),
+        (IpFamily::Ipv4, AF_INET) | (IpFamily::Ipv6, AF_INET6)
+    )
 }
 
 fn ipv6_unavailable(error: &io::Error) -> bool {
@@ -2114,6 +2134,20 @@ const fn align_to_4(length: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_records_to_the_requested_address_family() {
+        assert!(ip_address_matches_family(
+            Ipv4Addr::LOCALHOST.into(),
+            AF_INET
+        ));
+        assert!(!ip_address_matches_family(
+            Ipv4Addr::LOCALHOST.into(),
+            AF_INET6
+        ));
+        assert!(ip_family_matches_family(IpFamily::Ipv6, AF_INET6));
+        assert!(!ip_family_matches_family(IpFamily::Ipv4, AF_INET6));
+    }
 
     #[test]
     fn formats_neighbor_states() {

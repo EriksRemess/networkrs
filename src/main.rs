@@ -1689,10 +1689,44 @@ fn scan_cidr(value: &str) -> io::Result<scanner::Network> {
         u32::MAX << (32 - prefix)
     };
     let network_address = Ipv4Addr::from(u32::from(cidr_address) & mask);
-    let probe_address = if prefix <= 30 {
-        Ipv4Addr::from(u32::from(network_address) + 1)
-    } else {
-        network_address
+    let broadcast = Ipv4Addr::from(u32::from(network_address) | !mask);
+    let configured_addresses = netlink::ipv4_addresses()?;
+    let local_addresses = configured_addresses
+        .iter()
+        .filter_map(|address| match address.local {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    // A lookup for one of this host's addresses selects the local table and lo,
+    // which does not identify the interface that owns the selected subnet.
+    let Some(probe_address) =
+        first_non_local_scan_address(network_address, broadcast, prefix, &local_addresses)
+    else {
+        let address = configured_addresses
+            .into_iter()
+            .find_map(|address| match address.local {
+                IpAddr::V4(local)
+                    if u32::from(local) >= u32::from(network_address)
+                        && u32::from(local) <= u32::from(broadcast) =>
+                {
+                    Some((local, address.interface_index))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "CIDR contains no address that can be used for route selection",
+                )
+            })?;
+        return Ok(scanner::Network::for_cidr(
+            interface_label(&interface_names(), address.1),
+            address.1,
+            address.0,
+            network_address,
+            prefix,
+        ));
     };
     let route = netlink::ipv4_route(probe_address)?;
     if let Some(gateway) = route.gateway {
@@ -1727,6 +1761,35 @@ fn scan_cidr(value: &str) -> io::Result<scanner::Network> {
         network_address,
         prefix,
     ))
+}
+
+fn first_non_local_scan_address(
+    network: Ipv4Addr,
+    broadcast: Ipv4Addr,
+    prefix: u32,
+    local_addresses: &HashSet<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    let mut candidate = if prefix <= 30 {
+        u32::from(network) + 1
+    } else {
+        u32::from(network)
+    };
+    let last = if prefix <= 30 {
+        u32::from(broadcast) - 1
+    } else {
+        u32::from(broadcast)
+    };
+    while candidate <= last {
+        let address = Ipv4Addr::from(candidate);
+        if !local_addresses.contains(&address) {
+            return Some(address);
+        }
+        if candidate == last {
+            break;
+        }
+        candidate += 1;
+    }
+    None
 }
 
 fn parse_ipv4_cidr(value: &str) -> io::Result<(Ipv4Addr, u32)> {
@@ -3381,6 +3444,30 @@ mod tests {
         );
         assert!(parse_ipv4_cidr("192.168.1.0/33").is_err());
         assert!(parse_ipv4_cidr("example/24").is_err());
+    }
+
+    #[test]
+    fn avoids_local_addresses_for_cidr_route_selection() {
+        let local_addresses =
+            HashSet::from([Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 53)]);
+        assert_eq!(
+            first_non_local_scan_address(
+                Ipv4Addr::new(10, 0, 0, 0),
+                Ipv4Addr::new(10, 0, 0, 255),
+                24,
+                &local_addresses,
+            ),
+            Some(Ipv4Addr::new(10, 0, 0, 2))
+        );
+        assert_eq!(
+            first_non_local_scan_address(
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 1),
+                32,
+                &local_addresses,
+            ),
+            None
+        );
     }
 
     #[test]
