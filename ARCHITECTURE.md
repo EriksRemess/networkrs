@@ -116,9 +116,10 @@ The following library calls generate traffic:
 - `ping::echo` sends ICMP echo requests.
 
 The CLI also performs TCP connection attempts in `probe` and `check --active`.
-Do not add active behavior to passive snapshot functions. New active APIs must
-say what they send, how many targets they can reach, and how they bound time and
-resource use.
+`probe` accepts at most 4096 distinct ports and runs at most 64 connection
+attempts concurrently, each bounded by its configured timeout. Do not add active
+behavior to passive snapshot functions. New active APIs must say what they send,
+how many targets they can reach, and how they bound time and resource use.
 
 ## Adding a kernel attribute
 

@@ -74,7 +74,7 @@ networkrs neighbors [INTERFACE]
 networkrs scan [OPTIONS] [INTERFACE|IPv4/CIDR]
 networkrs watch
 networkrs check [--active]
-networkrs probe HOST [PORT] [--timeout MS]
+networkrs probe HOST [PORTS] [--timeout MS]
 networkrs sockets [all|tcp|udp|listening|connected]
 networkrs traffic [INTERFACE] [--interval MS] [--watch]
 networkrs wifi
@@ -170,10 +170,15 @@ IPv4 or IPv6 nameserver, measures gateway ICMP echo loss and min/average/max lat
 and times a TCP connection to port 53. ICMP is skipped if Linux ping-socket
 policy denies it. A refused TCP port still proves that the host was reached.
 
-`probe HOST [PORT]` resolves an IPv4 or IPv6 destination through NSS, shows the kernel's
-chosen route, and times a TCP connection (default port 443 and three-second
-timeout). `--timeout MS` accepts 100 through 60000. Connection refusal counts as
-host reachability and other errors return status 1.
+`probe HOST [PORTS]` resolves an IPv4 or IPv6 destination through NSS, shows the
+kernel's chosen route, and times TCP connections. The optional port expression
+accepts comma-separated ports and inclusive ranges, for example
+`probe router.example 22,80,443,8000-8010`. It defaults to port 443, probes at
+most 4096 distinct ports with at most 64 concurrent connections, and preserves
+the existing single-port output for one selected port. `--timeout MS` sets the
+per-port timeout and accepts 100 through 60000. A connected or refused port
+proves host reachability; the command returns status 1 only when every selected
+port fails for another reason.
 
 ### DNS
 

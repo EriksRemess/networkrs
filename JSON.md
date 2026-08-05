@@ -41,7 +41,7 @@ field should be treated as an API change.
 | `neighbors` | array | IPv4 and IPv6 neighbor records |
 | `scan` | object | `networks`, `neighbors`, changed count, elapsed time |
 | `check` | object | active flag, health result, warning count, check records |
-| `probe` | object | resolved destination, route, reachability, result and timing |
+| `probe` | object | resolved destination, route, per-port reachability, result and timing |
 | `sockets` | object | diagnostic availability/error and socket array |
 | `traffic` | object | elapsed time and per-interface direction rates |
 | `wifi` | array | nl80211 interface and station records |
@@ -76,9 +76,15 @@ window/retransmission counters.
 when the operation cannot be performed. Individual check records use statuses
 such as `ok`, `warning`, `reached`, `skipped`, and `not-applicable`.
 
-`probe` exits with status 0 for a connected or explicitly refused TCP
-connection. Refusal demonstrates that the destination host was reached. Other
-connection failures set `reachable` to false and return status 1. Argument,
+For a single selected port, `probe` retains the scalar `port`, `status`, `error`,
+and `elapsedMilliseconds` fields. A multi-port probe replaces those scalar
+result fields with a `ports` array; each entry contains `port`, `status`, `open`,
+`reachable`, `error`, and `elapsedMilliseconds`. The top-level elapsed value is
+the wall-clock duration of the bounded concurrent scan.
+
+`probe` exits with status 0 when any selected port connects or explicitly
+refuses the connection. Refusal demonstrates that the destination host was
+reached. It returns status 1 when every port fails for another reason. Argument,
 resolution, and route lookup errors return status 2.
 
 ## Streaming records

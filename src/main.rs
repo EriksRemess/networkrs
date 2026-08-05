@@ -15,11 +15,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const SYS_CLASS_NET: &str = "/sys/class/net";
 const PROC_NET_ROUTE: &str = "/proc/net/route";
 const PROC_NET_IF_INET6: &str = "/proc/net/if_inet6";
 const RESOLV_CONF: &str = "/etc/resolv.conf";
+const MAX_PROBE_PORTS: usize = 4096;
+const MAX_CONCURRENT_PROBES: usize = 64;
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -706,7 +710,7 @@ fn optional_json_bool(value: Option<bool>) -> json::Value {
 }
 
 fn usage() -> &'static str {
-    "Usage: networkrs [--json] [COMMAND]\n\nCommands:\n  all                    Show current network configuration (default)\n  interfaces             Show interfaces, addresses, link state, and counters\n  links                  Show kernel link topology and metadata\n  hardware [INTERFACE]   Show driver, link modes, features, and statistics\n  addresses              Show detailed kernel IP address records\n  routes                 Show all IPv4 and IPv6 routing tables\n  rules                  Show IPv4 and IPv6 policy-routing rules\n  route <ADDRESS>        Show the kernel route to an IP address\n  neighbors [INTERFACE]  Show cached IPv4 and IPv6 neighbors\n  scan [OPTIONS] [TARGET] Actively discover neighbors on a local IPv4 network\n  watch                  Stream kernel network changes\n  check [--active]       Check IPv4 health; optionally exercise the path\n  probe HOST [PORT]      Test an explicit TCP path and report route and timing\n  sockets [VIEW]         Show IP sockets (all, tcp, udp, listening, connected)\n  traffic [OPTIONS]      Sample or continuously watch interface traffic rates\n  wifi                   Show nl80211 Wi-Fi connection details\n  dns                    Show resolver configuration\n  help                   Show this help\n\nGlobal options:\n  --json                 Emit JSON; streaming commands emit one object per line"
+    "Usage: networkrs [--json] [COMMAND]\n\nCommands:\n  all                    Show current network configuration (default)\n  interfaces             Show interfaces, addresses, link state, and counters\n  links                  Show kernel link topology and metadata\n  hardware [INTERFACE]   Show driver, link modes, features, and statistics\n  addresses              Show detailed kernel IP address records\n  routes                 Show all IPv4 and IPv6 routing tables\n  rules                  Show IPv4 and IPv6 policy-routing rules\n  route <ADDRESS>        Show the kernel route to an IP address\n  neighbors [INTERFACE]  Show cached IPv4 and IPv6 neighbors\n  scan [OPTIONS] [TARGET] Actively discover neighbors on a local IPv4 network\n  watch                  Stream kernel network changes\n  check [--active]       Check IPv4 health; optionally exercise the path\n  probe HOST [PORTS]     Test one or more TCP ports and report route and timing\n  sockets [VIEW]         Show IP sockets (all, tcp, udp, listening, connected)\n  traffic [OPTIONS]      Sample or continuously watch interface traffic rates\n  wifi                   Show nl80211 Wi-Fi connection details\n  dns                    Show resolver configuration\n  help                   Show this help\n\nGlobal options:\n  --json                 Emit JSON; streaming commands emit one object per line"
 }
 
 fn print_system() {
@@ -1856,14 +1860,13 @@ fn parse_default_ipv4_route(contents: &str) -> Option<DefaultIpv4Route> {
 
 struct ProbeArguments {
     host: String,
-    port: u16,
+    ports: Vec<u16>,
     timeout_ms: u64,
 }
 
 fn parse_probe_arguments(arguments: &[String]) -> io::Result<ProbeArguments> {
     let mut host = None;
-    let mut port = 443_u16;
-    let mut port_set = false;
+    let mut ports = None;
     let mut timeout_ms = 3000_u64;
     let mut index = 0;
     while index < arguments.len() {
@@ -1885,12 +1888,7 @@ fn parse_probe_arguments(arguments: &[String]) -> io::Result<ProbeArguments> {
                 ));
             }
             value if host.is_none() => host = Some(value.to_owned()),
-            value if !port_set => {
-                port = value.parse().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "probe port must be a number")
-                })?;
-                port_set = true;
-            }
+            value if ports.is_none() => ports = Some(parse_probe_ports(value)?),
             value => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1903,21 +1901,171 @@ fn parse_probe_arguments(arguments: &[String]) -> io::Result<ProbeArguments> {
     Ok(ProbeArguments {
         host: host
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "probe requires a host"))?,
-        port,
+        ports: ports.unwrap_or_else(|| vec![443]),
         timeout_ms,
     })
 }
 
+fn parse_probe_ports(value: &str) -> io::Result<Vec<u16>> {
+    let mut ports = std::collections::BTreeSet::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "probe port list contains an empty item",
+            ));
+        }
+        if let Some((first, last)) = item.split_once('-') {
+            let first = parse_probe_port(first)?;
+            let last = parse_probe_port(last)?;
+            if first > last {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid descending port range: {item}"),
+                ));
+            }
+            for port in first..=last {
+                ports.insert(port);
+                if ports.len() > MAX_PROBE_PORTS {
+                    return Err(too_many_probe_ports());
+                }
+            }
+        } else {
+            ports.insert(parse_probe_port(item)?);
+        }
+        if ports.len() > MAX_PROBE_PORTS {
+            return Err(too_many_probe_ports());
+        }
+    }
+    Ok(ports.into_iter().collect())
+}
+
+fn parse_probe_port(value: &str) -> io::Result<u16> {
+    let port = value.parse::<u16>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid TCP port: {value}"),
+        )
+    })?;
+    if port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TCP port must be between 1 and 65535",
+        ));
+    }
+    Ok(port)
+}
+
+fn too_many_probe_ports() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("probe accepts at most {MAX_PROBE_PORTS} distinct ports"),
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TcpProbeStatus {
+    Connected,
+    ConnectionRefused,
+    Failed,
+}
+
+struct TcpProbeResult {
+    port: u16,
+    status: TcpProbeStatus,
+    error: Option<String>,
+    elapsed: std::time::Duration,
+}
+
+impl TcpProbeResult {
+    fn reachable(&self) -> bool {
+        self.status != TcpProbeStatus::Failed
+    }
+
+    fn status_name(&self) -> &'static str {
+        match self.status {
+            TcpProbeStatus::Connected => "connected",
+            TcpProbeStatus::ConnectionRefused => "connection-refused",
+            TcpProbeStatus::Failed => "failed",
+        }
+    }
+}
+
+fn tcp_probe(address: IpAddr, port: u16, timeout: std::time::Duration) -> TcpProbeResult {
+    let started = std::time::Instant::now();
+    let result = TcpStream::connect_timeout(&std::net::SocketAddr::new(address, port), timeout);
+    let elapsed = started.elapsed();
+    match result {
+        Ok(_) => TcpProbeResult {
+            port,
+            status: TcpProbeStatus::Connected,
+            error: None,
+            elapsed,
+        },
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => TcpProbeResult {
+            port,
+            status: TcpProbeStatus::ConnectionRefused,
+            error: Some(error.to_string()),
+            elapsed,
+        },
+        Err(error) => TcpProbeResult {
+            port,
+            status: TcpProbeStatus::Failed,
+            error: Some(error.to_string()),
+            elapsed,
+        },
+    }
+}
+
+fn tcp_probe_ports(
+    address: IpAddr,
+    ports: &[u16],
+    timeout: std::time::Duration,
+) -> Vec<TcpProbeResult> {
+    if let [port] = ports {
+        return vec![tcp_probe(address, *port, timeout)];
+    }
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(ports.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..ports.len().min(MAX_CONCURRENT_PROBES) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&port) = ports.get(index) else {
+                        break;
+                    };
+                    let result = tcp_probe(address, port, timeout);
+                    results
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(result);
+                }
+            });
+        }
+    });
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    results.sort_by_key(|result| result.port);
+    results
+}
+
 fn probe(arguments: &[String]) -> io::Result<bool> {
     let arguments = parse_probe_arguments(arguments)?;
-    let (destination, route) = resolve_probe_destination(&arguments.host, arguments.port)?;
+    let (destination, route) = resolve_probe_destination(&arguments.host, arguments.ports[0])?;
     let interface_names = interface_names();
-    println!(
-        "TCP probe {}:{} ({})",
-        arguments.host,
-        arguments.port,
-        destination.ip()
-    );
+    if arguments.ports.len() == 1 {
+        println!(
+            "TCP probe {}:{} ({})",
+            arguments.host,
+            arguments.ports[0],
+            destination.ip()
+        );
+    } else {
+        println!("TCP port scan {} ({})", arguments.host, destination.ip());
+    }
     println!(
         "  Route: {}{}{} source {}",
         route
@@ -1938,58 +2086,120 @@ fn probe(arguments: &[String]) -> io::Result<bool> {
             .unwrap_or_else(|| "unknown".into())
     );
     let started = std::time::Instant::now();
-    match TcpStream::connect_timeout(
-        &destination,
+    let results = tcp_probe_ports(
+        destination.ip(),
+        &arguments.ports,
         std::time::Duration::from_millis(arguments.timeout_ms),
-    ) {
-        Ok(_) => {
-            println!(
+    );
+    if let [result] = results.as_slice() {
+        match result.status {
+            TcpProbeStatus::Connected => println!(
                 "  Result: connected in {:.1}ms",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-            Ok(true)
-        }
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-            println!(
+                result.elapsed.as_secs_f64() * 1000.0
+            ),
+            TcpProbeStatus::ConnectionRefused => println!(
                 "  Result: host reached in {:.1}ms; connection refused",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-            Ok(true)
+                result.elapsed.as_secs_f64() * 1000.0
+            ),
+            TcpProbeStatus::Failed => println!(
+                "  Result: failed after {:.1}ms: {}",
+                result.elapsed.as_secs_f64() * 1000.0,
+                result.error.as_deref().unwrap_or("unknown error")
+            ),
         }
-        Err(error) => {
-            println!(
-                "  Result: failed after {:.1}ms: {error}",
-                started.elapsed().as_secs_f64() * 1000.0
-            );
-            Ok(false)
+    } else {
+        for result in &results {
+            match result.status {
+                TcpProbeStatus::Connected => println!(
+                    "  {}/tcp open in {:.1}ms",
+                    result.port,
+                    result.elapsed.as_secs_f64() * 1000.0
+                ),
+                TcpProbeStatus::ConnectionRefused => println!(
+                    "  {}/tcp closed in {:.1}ms (connection refused)",
+                    result.port,
+                    result.elapsed.as_secs_f64() * 1000.0
+                ),
+                TcpProbeStatus::Failed => println!(
+                    "  {}/tcp failed after {:.1}ms: {}",
+                    result.port,
+                    result.elapsed.as_secs_f64() * 1000.0,
+                    result.error.as_deref().unwrap_or("unknown error")
+                ),
+            }
         }
+        let open = results
+            .iter()
+            .filter(|result| result.status == TcpProbeStatus::Connected)
+            .count();
+        let closed = results
+            .iter()
+            .filter(|result| result.status == TcpProbeStatus::ConnectionRefused)
+            .count();
+        let failed = results.len() - open - closed;
+        println!(
+            "Port scan complete: {open} open, {closed} closed, {failed} failed, {:.1}ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
+    Ok(results.iter().any(TcpProbeResult::reachable))
 }
 
 fn probe_json(arguments: &[String]) -> io::Result<(json::Value, bool)> {
     let arguments = parse_probe_arguments(arguments)?;
-    let (destination, route) = resolve_probe_destination(&arguments.host, arguments.port)?;
+    let (destination, route) = resolve_probe_destination(&arguments.host, arguments.ports[0])?;
     let route_value = json_route(route);
     let started = std::time::Instant::now();
-    let (reachable, status, error) = match TcpStream::connect_timeout(
-        &destination,
+    let results = tcp_probe_ports(
+        destination.ip(),
+        &arguments.ports,
         std::time::Duration::from_millis(arguments.timeout_ms),
-    ) {
-        Ok(_) => (true, "connected", None),
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
-            (true, "connection-refused", Some(error.to_string()))
-        }
-        Err(error) => (false, "failed", Some(error.to_string())),
-    };
+    );
+    let reachable = results.iter().any(TcpProbeResult::reachable);
+    if let [result] = results.as_slice() {
+        return Ok((
+            json::Value::object([
+                ("host", json::Value::string(arguments.host)),
+                ("port", json::Value::number(result.port)),
+                ("address", json::Value::string(destination.ip().to_string())),
+                ("route", route_value),
+                ("reachable", json::Value::Bool(reachable)),
+                ("status", json::Value::string(result.status_name())),
+                ("error", json::optional_string(result.error.as_deref())),
+                (
+                    "elapsedMilliseconds",
+                    json::Value::number(format!("{:.3}", result.elapsed.as_secs_f64() * 1000.0)),
+                ),
+            ]),
+            reachable,
+        ));
+    }
+    let port_results = results
+        .into_iter()
+        .map(|result| {
+            json::Value::object([
+                ("port", json::Value::number(result.port)),
+                ("status", json::Value::string(result.status_name())),
+                (
+                    "open",
+                    json::Value::Bool(result.status == TcpProbeStatus::Connected),
+                ),
+                ("reachable", json::Value::Bool(result.reachable())),
+                ("error", json::optional_string(result.error)),
+                (
+                    "elapsedMilliseconds",
+                    json::Value::number(format!("{:.3}", result.elapsed.as_secs_f64() * 1000.0)),
+                ),
+            ])
+        })
+        .collect();
     Ok((
         json::Value::object([
             ("host", json::Value::string(arguments.host)),
-            ("port", json::Value::number(arguments.port)),
             ("address", json::Value::string(destination.ip().to_string())),
             ("route", route_value),
             ("reachable", json::Value::Bool(reachable)),
-            ("status", json::Value::string(status)),
-            ("error", json::optional_string(error)),
+            ("ports", json::Value::Array(port_results)),
             (
                 "elapsedMilliseconds",
                 json::Value::number(format!("{:.3}", started.elapsed().as_secs_f64() * 1000.0)),
@@ -3495,15 +3705,24 @@ mod tests {
     fn parses_probe_controls() {
         let parsed = parse_probe_arguments(&[
             "example.test".into(),
-            "8443".into(),
+            "22,80,443,8000-8002".into(),
             "--timeout".into(),
             "750".into(),
         ])
         .unwrap();
         assert_eq!(parsed.host, "example.test");
-        assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.ports, [22, 80, 443, 8000, 8001, 8002]);
         assert_eq!(parsed.timeout_ms, 750);
+        assert_eq!(parse_probe_ports("443,22,443").unwrap(), [22, 443]);
+        assert_eq!(
+            parse_probe_arguments(&["host".into()]).unwrap().ports,
+            [443]
+        );
         assert!(parse_probe_arguments(&["host".into(), "--timeout".into(), "20".into()]).is_err());
+        assert!(parse_probe_arguments(&["host".into(), "0".into()]).is_err());
+        assert!(parse_probe_arguments(&["host".into(), "90-80".into()]).is_err());
+        assert!(parse_probe_arguments(&["host".into(), "22,,80".into()]).is_err());
+        assert!(parse_probe_arguments(&["host".into(), "1-4097".into()]).is_err());
     }
 
     #[test]
